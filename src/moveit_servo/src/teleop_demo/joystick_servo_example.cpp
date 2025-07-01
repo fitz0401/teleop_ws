@@ -52,6 +52,8 @@
 #include <rclcpp/subscription.hpp>
 #include <rclcpp/time.hpp>
 #include <rclcpp/utilities.hpp>
+#include <rclcpp_action/rclcpp_action.hpp>
+#include <control_msgs/action/gripper_command.hpp>
 #include <thread>
 
 // We'll just set up parameters here
@@ -104,27 +106,8 @@ std::map<Button, double> BUTTON_DEFAULTS;
  * @return return true if you want to publish a Twist, false if you want to publish a JointJog
  */
 bool convertJoyToCmd(const std::vector<float>& axes, const std::vector<int>& buttons,
-                     std::unique_ptr<geometry_msgs::msg::TwistStamped>& twist,
-                     std::unique_ptr<control_msgs::msg::JointJog>& joint)
+                     std::unique_ptr<geometry_msgs::msg::TwistStamped>& twist)
 {
-  // Give joint jogging priority because it is only buttons
-  // If any joint jog command is requested, we are only publishing joint commands
-  if (buttons[A] || buttons[B] || buttons[X] || buttons[Y] || axes[D_PAD_X] || axes[D_PAD_Y])
-  {
-    // Map the D_PAD to the proximal joints
-    joint->joint_names.push_back("fr3_joint1");
-    joint->velocities.push_back(axes[D_PAD_X]);
-    joint->joint_names.push_back("fr3_joint2");
-    joint->velocities.push_back(axes[D_PAD_Y]);
-
-    // Map the diamond to the distal joints
-    joint->joint_names.push_back("fr3_joint7");
-    joint->velocities.push_back(buttons[B] - buttons[X]);
-    joint->joint_names.push_back("fr3_joint6");
-    joint->velocities.push_back(buttons[Y] - buttons[A]);
-    return false;
-  }
-
   // The bread and butter: map buttons to twist commands
   twist->twist.linear.z = axes[RIGHT_STICK_Y];
   twist->twist.linear.y = axes[RIGHT_STICK_X];
@@ -178,46 +161,9 @@ public:
     servo_start_client_->wait_for_service(std::chrono::seconds(1));
     servo_start_client_->async_send_request(std::make_shared<std_srvs::srv::Trigger::Request>());
 
-    // // Load the collision scene asynchronously
-    // collision_pub_thread_ = std::thread([this]() {
-    //   rclcpp::sleep_for(std::chrono::seconds(3));
-    //   // Create collision object, in the way of servoing
-    //   moveit_msgs::msg::CollisionObject collision_object;
-    //   collision_object.header.frame_id = "fr3_link0";
-    //   collision_object.id = "box";
-
-    //   shape_msgs::msg::SolidPrimitive table_1;
-    //   table_1.type = table_1.BOX;
-    //   table_1.dimensions = { 0.4, 0.6, 0.03 };
-
-    //   geometry_msgs::msg::Pose table_1_pose;
-    //   table_1_pose.position.x = 0.6;
-    //   table_1_pose.position.y = 0.0;
-    //   table_1_pose.position.z = 0.4;
-
-    //   shape_msgs::msg::SolidPrimitive table_2;
-    //   table_2.type = table_2.BOX;
-    //   table_2.dimensions = { 0.6, 0.4, 0.03 };
-
-    //   geometry_msgs::msg::Pose table_2_pose;
-    //   table_2_pose.position.x = 0.0;
-    //   table_2_pose.position.y = 0.5;
-    //   table_2_pose.position.z = 0.25;
-
-    //   collision_object.primitives.push_back(table_1);
-    //   collision_object.primitive_poses.push_back(table_1_pose);
-    //   collision_object.primitives.push_back(table_2);
-    //   collision_object.primitive_poses.push_back(table_2_pose);
-    //   collision_object.operation = collision_object.ADD;
-
-    //   moveit_msgs::msg::PlanningSceneWorld psw;
-    //   psw.collision_objects.push_back(collision_object);
-
-    //   auto ps = std::make_unique<moveit_msgs::msg::PlanningScene>();
-    //   ps->world = psw;
-    //   ps->is_diff = true;
-    //   collision_pub_->publish(std::move(ps));
-    // });
+    gripper_client_ = rclcpp_action::create_client<control_msgs::action::GripperCommand>(
+      this, "/fr3_gripper/gripper_action"
+    );
   }
 
   ~JoyToServoPub() override
@@ -226,29 +172,44 @@ public:
       collision_pub_thread_.join();
   }
 
+  void sendGripperCommand(double position, double max_effort)
+  {
+    if (!gripper_client_->wait_for_action_server(std::chrono::seconds(1)))
+    {
+      RCLCPP_WARN(this->get_logger(), "Gripper action server not available.");
+      return;
+    }
+    auto goal_msg = control_msgs::action::GripperCommand::Goal();
+    goal_msg.command.position = position;
+    goal_msg.command.max_effort = max_effort;
+    gripper_client_->async_send_goal(goal_msg);
+  }
+
   void joyCB(const sensor_msgs::msg::Joy::ConstSharedPtr& msg)
   {
     // Create the messages we might publish
     auto twist_msg = std::make_unique<geometry_msgs::msg::TwistStamped>();
-    auto joint_msg = std::make_unique<control_msgs::msg::JointJog>();
 
     // This call updates the frame for twist commands
     updateCmdFrame(frame_to_publish_, msg->buttons);
 
     // Convert the joystick message to Twist or JointJog and publish
-    if (convertJoyToCmd(msg->axes, msg->buttons, twist_msg, joint_msg))
+    if (convertJoyToCmd(msg->axes, msg->buttons, twist_msg))
     {
       // publish the TwistStamped
       twist_msg->header.frame_id = frame_to_publish_;
       twist_msg->header.stamp = this->now();
       twist_pub_->publish(std::move(twist_msg));
     }
-    else
+    // Close
+    if (msg->buttons[A])
     {
-      // publish the JointJog
-      joint_msg->header.stamp = this->now();
-      joint_msg->header.frame_id = "fr3_link3";
-      joint_pub_->publish(std::move(joint_msg));
+      this->sendGripperCommand(0.0, 20.0);
+    }
+    // Open
+    else if (msg->buttons[B])
+    {
+      this->sendGripperCommand(0.039, 20.0);
     }
   }
 
@@ -258,6 +219,8 @@ private:
   rclcpp::Publisher<control_msgs::msg::JointJog>::SharedPtr joint_pub_;
   rclcpp::Publisher<moveit_msgs::msg::PlanningScene>::SharedPtr collision_pub_;
   rclcpp::Client<std_srvs::srv::Trigger>::SharedPtr servo_start_client_;
+
+  rclcpp_action::Client<control_msgs::action::GripperCommand>::SharedPtr gripper_client_;
 
   std::string frame_to_publish_;
 

@@ -172,6 +172,8 @@ if(BUILD_TESTING)
   find_package(ament_cmake_gtest REQUIRED)
   find_package(ros_testing REQUIRED)
   find_package(Boost REQUIRED COMPONENTS filesystem)
+  find_package(rclcpp_action REQUIRED)
+  find_package(control_msgs REQUIRED)
 
   # These don't pass yet, disable them for now
   set(ament_cmake_copyright_FOUND TRUE)
